@@ -70,6 +70,51 @@ class ScanRequest(BaseModel):
     range: ScanRangeIn
 
 
+class InitialStateIn(BaseModel):
+    """反应器初始状态输入（非负性由动态模块校验）。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    S_init: float
+    X_init: float
+
+    @field_validator("S_init", "X_init", mode="before")
+    @classmethod
+    def _reject_non_finite(cls, value: object, info) -> float:
+        return _finite_number(value, info.field_name)
+
+
+class SimulationRequest(BaseModel):
+    """临时参数动态仿真请求：参数 + 初值 + 时长 + 输出点数。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    parameters: ProcessParametersIn
+    initial_state: InitialStateIn
+    duration: float
+    num_points: int
+
+    @field_validator("duration", mode="before")
+    @classmethod
+    def _reject_non_finite(cls, value: object, info) -> float:
+        return _finite_number(value, info.field_name)
+
+
+class ProfileSimulationRequest(BaseModel):
+    """凭档仿真请求：参数从档案取回，这里只给初值与时间设置。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    initial_state: InitialStateIn
+    duration: float
+    num_points: int
+
+    @field_validator("duration", mode="before")
+    @classmethod
+    def _reject_non_finite(cls, value: object, info) -> float:
+        return _finite_number(value, info.field_name)
+
+
 class ProfileCreateIn(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -111,6 +156,24 @@ class SteadyStateOut(BaseModel):
 class ScanResponse(BaseModel):
     points: list[SteadyStateOut]
     count: int
+
+
+class TrajectoryPointOut(BaseModel):
+    """动态轨迹上的一个采样点。"""
+
+    t: float
+    S: float
+    X: float
+
+
+class SimulationResponse(BaseModel):
+    """动态仿真结果：轨迹 + 同参数稳态解（供直接核对收敛终点）。"""
+
+    points: list[TrajectoryPointOut]
+    count: int
+    is_washout: bool
+    converged: bool
+    steady_state: SteadyStateOut
 
 
 class ProfileOut(BaseModel):

@@ -3,6 +3,7 @@
 职责边界：
   * :mod:`app.kinetics` —— Monod 动力学；
   * :mod:`app.solver`   —— 稳态求解、冲刷判定、参数合法性；
+  * :mod:`app.dynamics` —— 动态仿真：ODE 时间推进积分；
   * :mod:`app.profiles` —— 具名参数档登记与取回；
   * :mod:`app.database` —— SQLite 持久化；
   * 本模块              —— 仅负责 HTTP 编解码、状态码与错误信封。
@@ -21,6 +22,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.database import Database
+from app.dynamics import (
+    build_initial_state,
+    build_time_grid,
+    simulate,
+)
 from app.profiles import (
     DEMO_PROFILE_NAME,
     ProfileAlreadyExistsError,
@@ -32,10 +38,14 @@ from app.schemas import (
     ProfileCreateIn,
     ProfileListResponse,
     ProfileOut,
+    ProfileSimulationRequest,
     ScanRangeIn,
     ScanRequest,
     ScanResponse,
+    SimulationRequest,
+    SimulationResponse,
     SteadyStateOut,
+    TrajectoryPointOut,
 )
 from app.solver import (
     ParameterValidationError,
@@ -89,6 +99,27 @@ def _profile_output(profile: StoredProfile) -> ProfileOut:
     )
 
 
+def _simulation_output(params, payload) -> SimulationResponse:
+    """跑一遍动态仿真并组装响应；稳态解一并附上供核对终点。"""
+    initial = build_initial_state(
+        s=payload.initial_state.S_init, x=payload.initial_state.X_init
+    )
+    duration, num_points = build_time_grid(
+        duration=payload.duration, num_points=payload.num_points
+    )
+    result = simulate(params, initial, duration, num_points)
+    return SimulationResponse(
+        points=[
+            TrajectoryPointOut(t=pt.t, S=pt.s, X=pt.x)
+            for pt in result.points
+        ],
+        count=len(result.points),
+        is_washout=result.is_washout,
+        converged=result.converged,
+        steady_state=_solution_output(solve_steady_state(params)),
+    )
+
+
 def _validation_error_response(
     code: str, message: str, errors: dict[str, str], status_code: int = 422
 ) -> JSONResponse:
@@ -107,11 +138,12 @@ def _validation_error_response(
 
 def create_app(db_path: str | None = None) -> FastAPI:
     app = FastAPI(
-        title="活性污泥 CSTR 稳态求解服务",
-        version="1.0.0",
+        title="活性污泥 CSTR 求解服务",
+        version="1.1.0",
         description=(
-            "单级完全混合反应器（CSTR）Monod 动力学稳态核算："
-            "单点求解、稀释率区间扫描、冲刷判定与具名参数档管理。"
+            "单级完全混合反应器（CSTR）Monod 动力学核算："
+            "稳态求解、稀释率区间扫描、冲刷判定、具名参数档管理，"
+            "以及从任意初值出发的时间推进动态仿真。"
         ),
     )
     app.state.db = Database(db_path or _db_path())
@@ -182,6 +214,18 @@ def create_app(db_path: str | None = None) -> FastAPI:
         solutions = scan_dilution(params, scan_range)
         points = [_solution_output(sol) for sol in solutions]
         return ScanResponse(points=points, count=len(points))
+
+    # ---------- 动态仿真（时间推进） ----------
+
+    @app.post(
+        "/api/simulate",
+        tags=["dynamics"],
+        response_model=SimulationResponse,
+    )
+    async def simulate_adhoc(payload: SimulationRequest) -> SimulationResponse:
+        """对临时丢进来的一组参数，从给定初值沿时间积分到稳态。"""
+        params = _parameters_from_input(payload.parameters)
+        return _simulation_output(params, payload)
 
     # ---------- 具名参数档 ----------
 
@@ -299,6 +343,28 @@ def create_app(db_path: str | None = None) -> FastAPI:
         solutions = scan_dilution(params, scan_range)
         points = [_solution_output(sol) for sol in solutions]
         return ScanResponse(points=points, count=len(points))
+
+    @app.post(
+        "/api/profiles/{name}/simulate",
+        tags=["profiles", "dynamics"],
+        response_model=SimulationResponse,
+    )
+    async def simulate_saved_profile(
+        name: str, payload: ProfileSimulationRequest
+    ) -> SimulationResponse:
+        """凭名取回档案参数，从给定初值沿时间积分到稳态。"""
+        try:
+            params = app.state.manager.get_parameters(name)
+        except KeyError:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": f"工况档案不存在: {name}",
+                    "code": "profile_not_found",
+                    "details": [],
+                },
+            )
+        return _simulation_output(params, payload)
 
     return app
 
