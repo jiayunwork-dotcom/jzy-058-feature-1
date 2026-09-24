@@ -21,6 +21,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.database import Database
+from app.dynamics import (
+    build_initial_state,
+    build_simulation_spec,
+    simulate,
+)
+from app.integrator import IntegrationError
 from app.profiles import (
     DEMO_PROFILE_NAME,
     ProfileAlreadyExistsError,
@@ -28,14 +34,20 @@ from app.profiles import (
     StoredProfile,
 )
 from app.schemas import (
+    InitialStateIn,
     ProcessParametersIn,
     ProfileCreateIn,
     ProfileListResponse,
     ProfileOut,
+    ProfileSimulationRequest,
     ScanRangeIn,
     ScanRequest,
     ScanResponse,
+    SimulationRequest,
+    SimulationResponse,
+    SimulationSetupIn,
     SteadyStateOut,
+    TrajectoryPointOut,
 )
 from app.solver import (
     ParameterValidationError,
@@ -74,6 +86,20 @@ def _solution_output(solution) -> SteadyStateOut:
     )
 
 
+def _simulation_output(result) -> SimulationResponse:
+    points = [
+        TrajectoryPointOut(time=pt.time, S=pt.s, X=pt.x, mu=pt.mu)
+        for pt in result.points
+    ]
+    return SimulationResponse(
+        duration=result.duration,
+        count=len(points),
+        points=points,
+        final=points[-1],
+        steady_state=_solution_output(result.steady_state),
+    )
+
+
 def _profile_output(profile: StoredProfile) -> ProfileOut:
     p = profile.parameters
     return ProfileOut(
@@ -107,11 +133,12 @@ def _validation_error_response(
 
 def create_app(db_path: str | None = None) -> FastAPI:
     app = FastAPI(
-        title="活性污泥 CSTR 稳态求解服务",
-        version="1.0.0",
+        title="活性污泥 CSTR 稳态求解与动态仿真服务",
+        version="1.1.0",
         description=(
-            "单级完全混合反应器（CSTR）Monod 动力学稳态核算："
-            "单点求解、稀释率区间扫描、冲刷判定与具名参数档管理。"
+            "单级完全混合反应器（CSTR）Monod 动力学核算："
+            "单点稳态求解、稀释率区间扫描、冲刷判定、具名参数档管理，"
+            "以及从初始状态沿时间轴积分的动态仿真轨迹。"
         ),
     )
     app.state.db = Database(db_path or _db_path())
@@ -127,6 +154,19 @@ def create_app(db_path: str | None = None) -> FastAPI:
             code="invalid_parameters",
             message="工况参数不合法",
             errors=exc.errors,
+        )
+
+    @app.exception_handler(IntegrationError)
+    async def handle_integration_error(_: Request, exc: IntegrationError):
+        # 输入已经过校验，推进仍失败属于服务端数值故障：明确 500，
+        # 绝不静默返回半截轨迹或负浓度
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": f"动态仿真推进失败: {exc}",
+                "code": "integration_failed",
+                "details": [],
+            },
         )
 
     @app.exception_handler(RequestValidationError)
@@ -182,6 +222,31 @@ def create_app(db_path: str | None = None) -> FastAPI:
         solutions = scan_dilution(params, scan_range)
         points = [_solution_output(sol) for sol in solutions]
         return ScanResponse(points=points, count=len(points))
+
+    # ---------- 动态仿真（随时间演化） ----------
+
+    def _run_simulation(params, setup: SimulationSetupIn, initial: InitialStateIn):
+        """参数 → 初值/设置校验 → 时间推进，整条链路复用既有内核。"""
+        init_state = build_initial_state(s=initial.S, x=initial.X)
+        spec = build_simulation_spec(
+            params,
+            initial_state=init_state,
+            duration=setup.duration,
+            num_points=setup.num_points,
+            interval=setup.interval,
+        )
+        return simulate(spec)
+
+    @app.post(
+        "/api/simulate",
+        tags=["dynamic"],
+        response_model=SimulationResponse,
+    )
+    async def simulate_ad_hoc(payload: SimulationRequest) -> SimulationResponse:
+        """对临时提交的一组工艺参数直接做随时间演化仿真。"""
+        params = _parameters_from_input(payload.parameters)
+        result = _run_simulation(params, payload, payload.initial_state)
+        return _simulation_output(result)
 
     # ---------- 具名参数档 ----------
 
@@ -299,6 +364,29 @@ def create_app(db_path: str | None = None) -> FastAPI:
         solutions = scan_dilution(params, scan_range)
         points = [_solution_output(sol) for sol in solutions]
         return ScanResponse(points=points, count=len(points))
+
+    @app.post(
+        "/api/profiles/{name}/simulate",
+        tags=["dynamic", "profiles"],
+        response_model=SimulationResponse,
+    )
+    async def simulate_saved_profile(
+        name: str, payload: ProfileSimulationRequest
+    ) -> SimulationResponse:
+        """凭名取回档案参数，按提交的初态与设置做随时间演化仿真。"""
+        try:
+            params = app.state.manager.get_parameters(name)
+        except KeyError:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": f"工况档案不存在: {name}",
+                    "code": "profile_not_found",
+                    "details": [],
+                },
+            )
+        result = _run_simulation(params, payload, payload.initial_state)
+        return _simulation_output(result)
 
     return app
 

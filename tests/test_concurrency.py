@@ -122,3 +122,63 @@ async def _concurrent_scan_and_solve(app):
 
 def test_concurrent_scans_are_isolated_and_consistent(transport_holder):
     _run(_concurrent_scan_and_solve(transport_holder))
+
+
+async def _concurrent_simulations(app):
+    """16 路动态仿真并发：各自轨迹不串号，末端各自对上稳态解。"""
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(
+        transport=transport, base_url="http://test"
+    ) as client:
+        # 每路用不同稀释率登记一具档案
+        for i in range(16):
+            dilution = round(0.05 + i * 0.02, 6)
+            await client.post(
+                "/api/profiles",
+                json={
+                    "name": f"sim-{i:02d}",
+                    "parameters": {**PARAMS, "D": dilution},
+                },
+            )
+
+        async def simulate_one(i: int):
+            dilution = round(0.05 + i * 0.02, 6)
+            # 初态也各不相同，进一步防止轨迹数据互相串改
+            resp = await client.post(
+                f"/api/profiles/sim-{i:02d}/simulate",
+                json={
+                    "initial_state": {"S": float(i), "X": 1.0 + i},
+                    "duration": 300,
+                    "num_points": 31,
+                },
+            )
+            assert resp.status_code == 200, resp.text
+            body = resp.json()
+            solved = await client.post(f"/api/profiles/sim-{i:02d}/solve")
+            steady = solved.json()
+            if steady["is_washout"]:
+                assert body["final"]["X"] < 1e-2
+            else:
+                assert body["final"]["S"] == pytest.approx(
+                    steady["S"], abs=5e-3
+                )
+                assert body["final"]["X"] == pytest.approx(
+                    steady["X"], abs=5e-3
+                )
+            return i, dilution, body["final"]["S"], body["final"]["X"]
+
+        results = await asyncio.gather(*(simulate_one(i) for i in range(16)))
+
+        # 重放一遍：并发仿真没有改动任何档案参数，复算结果稳定
+        for i, dilution, _s, _x in results:
+            stored = await client.get(f"/api/profiles/sim-{i:02d}")
+            assert stored.json()["parameters"]["D"] == pytest.approx(dilution)
+
+        # 不同稀释率末端污泥量互异，没有串号
+        biomass = {round(r[3], 6) for r in results}
+        assert len(biomass) == 16
+        return results
+
+
+def test_concurrent_simulations_are_isolated(transport_holder):
+    _run(_concurrent_simulations(transport_holder))

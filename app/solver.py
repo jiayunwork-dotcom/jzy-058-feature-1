@@ -99,6 +99,16 @@ def _as_decimal(value: Any, field: str) -> Decimal:
     return dec
 
 
+def parse_decimal(value: Any, field: str) -> Decimal:
+    """把工艺/仿真输入统一解析为 Decimal 的公开入口。
+
+    动态模块（:mod:`app.dynamics`）需要对初值、时长、粒度复用同一套
+    “拒布尔 / 拒 NaN 无穷 / 字符串按十进制精确解析”口径，统一走这里，
+    避免校验规则在多个模块各写一份。
+    """
+    return _as_decimal(value, field)
+
+
 def build_parameters(
     *,
     s0: Any,
